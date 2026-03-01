@@ -2,7 +2,9 @@
 
 ## Overview
 
-A Go CLI tool that generates random chords/melodies and outputs `.mid` files. Built from scratch with minimal dependencies — the MIDI writer will be pure Go, and audio playback will use a single lightweight library.
+A Go CLI tool that generates random MIDI chords and melodies and outputs `.mid`
+files. Built from scratch with minimal dependencies — the MIDI writer is pure Go,
+and audio playback uses a single lightweight library (`oto`).
 
 ---
 
@@ -12,229 +14,254 @@ A Go CLI tool that generates random chords/melodies and outputs `.mid` files. Bu
 midi-gen/
 ├── main.go              # CLI entry point (flag parsing, dispatch)
 ├── midi/
-│   ├── writer.go        # Raw MIDI file serialization (no libs)
-│   └── types.go         # MIDI structs: File, Track, Event
+│   ├── types.go         # MIDI structs + event constructors (NoteOn, NoteOff, Tempo)
+│   └── writer.go        # Raw MIDI binary serialization
 ├── theory/
-│   ├── scales.go        # Scale definitions, note lookup tables
-│   ├── chords.go        # Chord builders (triads, 7ths, extensions)
-│   └── generator.go     # Random melody/chord progression logic
+│   ├── scales.go        # Scale definitions, note lookup, NoteNumber parser
+│   ├── chords.go        # Chord builders, inversions
+│   └── generator.go     # Random melody/chord/progression generation
 ├── synth/
-│   ├── sine.go          # Sine wave oscillator
-│   ├── scheduler.go     # MIDI event → audio timing engine
-│   └── output.go        # Audio device output (oto)
+│   ├── sine.go          # Sine oscillator + ADSR envelope
+│   ├── reverb.go        # Schroeder reverb (4 comb + 2 allpass filters)
+│   ├── scheduler.go     # MIDI event → PCM timing engine
+│   └── output.go        # Audio device output via oto
 └── go.mod
 ```
 
 ---
 
-## Phase 1 — MIDI File Writer (Pure Go)
+## Phase 1 — MIDI File Writer ✅
 
-### The Binary Format
+### Binary Format
 
-A `.mid` file is a well-documented binary format. You write it byte by byte:
+A `.mid` file is a binary format written byte by byte.
 
-**Header Chunk** (14 bytes always):
+**Header Chunk** (14 bytes, always fixed):
 ```
 4D546864  → "MThd" magic bytes
-00000006  → chunk length = 6
+00000006  → chunk length = 6 (always)
 0001      → format type (0=single track, 1=multi-track)
 0001      → number of tracks
-0060      → ticks per quarter note (96 is common)
+0060      → ticks per quarter note (480 is the DAW standard)
 ```
 
 **Track Chunk**:
 ```
 4D54726B  → "MTrk" magic bytes
-XXXXXXXX  → chunk length (computed after events are serialized)
+XXXXXXXX  → chunk length (computed after events are serialized, then backfilled)
 [events]
-FF 2F 00  → End of Track meta-event (required)
+FF 2F 00  → End of Track meta-event (mandatory — DAWs reject files without it)
 ```
 
-**Events** use *variable-length delta times* (the main gotcha). Each event is preceded by how many ticks since the last event. Delta time encoding: 7 bits per byte, MSB=1 means "more bytes follow", MSB=0 is last byte. Example: 0 = `0x00`, 96 = `0x60`, 128 = `0x81 0x00`.
+**Variable-length delta times**: each event is preceded by how many ticks since
+the last event. Encoding uses 7 bits per byte; MSB=1 means more bytes follow,
+MSB=0 is the last byte.
 
-**Note events** (the two you'll use most):
+**Note events**:
 ```
-Note On:  [delta] 9n kk vv   (n=channel, kk=key 0-127, vv=velocity)
+Note On:  [delta] 9n kk vv   (n=channel, kk=key 0–127, vv=velocity)
 Note Off: [delta] 8n kk vv
 ```
 
-**`midi/types.go`** — define these structs:
-```go
-type Event struct {
-    Delta   uint32  // ticks since last event
-    Data    []byte  // raw MIDI bytes
-}
+### Key Implementation Decisions
 
-type Track struct {
-    Events []Event
-}
-
-type File struct {
-    Format     uint16
-    TicksPerQN uint16
-    Tracks     []Track
-}
-```
-
-**`midi/writer.go`** — key functions to implement:
-- `encodeVarLen(n uint32) []byte` — the variable-length encoding
-- `(f *File) Serialize() []byte` — walks the struct, writes chunks
-- `WriteFile(path string, f *File) error` — calls Serialize, writes to disk
-
-This is ~100 lines of pure Go. No external packages needed.
+- `encodeVarLen` is unit-tested at every byte-width boundary: 0, 127, 128, 255,
+  16383, 16384, and 0xFFFFFFF.
+- Track chunk length is computed by serializing events into a temporary buffer
+  first, measuring it, then writing the header — the length is not known in advance.
+- `NoteOn`, `NoteOff`, and `Tempo` are constructor functions on `types.go` that
+  handle all bit manipulation internally. Callers never touch raw status bytes.
+- All data bytes are masked (`& 0x7F`, `& 0x0F`) to prevent corruption of the
+  MIDI byte stream.
 
 ---
 
-## Phase 2 — Music Theory Engine
+## Phase 2 — Music Theory Engine ✅
 
 ### Note Representation
 
-Use MIDI note numbers (0–127). Middle C = 60.
+MIDI note numbers 0–127. Middle C = C4 = 60.
 
-```go
-// In scales.go
-var noteNames = []string{"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}
+`NoteNumber(string)` parses human-readable notation (`"C4"`, `"F#3"`, `"Bb2"`)
+into MIDI note numbers. Handles sharps, flats, enharmonic equivalents, and the
+`B`/`Bb` ambiguity (uppercase `B` is both a note name and a flat symbol after
+conversion).
 
-func NoteNumber(name string, octave int) int {
-    // returns e.g. NoteNumber("C", 4) → 60
-}
-```
+### Scales
 
-**Scale definitions** — store as semitone intervals from root:
 ```go
 var Scales = map[string][]int{
-    "major":          {0,2,4,5,7,9,11},
-    "minor":          {0,2,3,5,7,8,10},
-    "pentatonic":     {0,2,4,7,9},
-    "blues":          {0,3,5,6,7,10},
-    "dorian":         {0,2,3,5,7,9,10},
+    "major":        {0,2,4,5,7,9,11},
+    "minor":        {0,2,3,5,7,8,10},
+    "pentatonic":   {0,2,4,7,9},
+    "blues":        {0,3,5,6,7,10},
+    "dorian":       {0,2,3,5,7,9,10},
+    "phrygian":     {0,1,3,5,7,8,10},
+    "lydian":       {0,2,4,6,7,9,11},
+    "mixolydian":   {0,2,4,5,7,9,10},
+    "harmonicminor":{0,2,3,5,7,8,11},
+    "wholetone":    {0,2,4,6,8,10},
+    "diminished":   {0,1,3,4,6,7,9,10},
 }
 ```
 
-**`chords.go`** — build chords from a root + quality:
-```go
-var ChordIntervals = map[string][]int{
-    "major":   {0,4,7},
-    "minor":   {0,3,7},
-    "dom7":    {0,4,7,10},
-    "maj7":    {0,4,7,11},
-    "min7":    {0,3,7,10},
-    "dim":     {0,3,6},
-    "aug":     {0,4,8},
-    "sus2":    {0,2,7},
-    "sus4":    {0,5,7},
-}
+### Chords
 
-func BuildChord(root int, quality string) []int {
-    // returns slice of MIDI note numbers
-}
-```
+22 chord qualities from triads through 13th chords. `BuildChordInversion` raises
+the lowest note of a voicing by one octave per inversion step, enabling smooth
+voice leading between chord changes.
 
-**`generator.go`** — the randomization layer:
-```go
-type GeneratorConfig struct {
-    Scale      string
-    RootNote   int     // e.g. 60 for C4
-    Octaves    int     // range to span
-    Length     int     // number of notes/chords
-    MinVel     int
-    MaxVel     int
-    Complexity string  // "simple" | "medium" | "complex"
-    Mode       string  // "melody" | "chords" | "progression"
-    BPM        int
-    Quantize   string  // "quarter" | "eighth" | "sixteenth"
-}
-```
+### Generator
 
-Complexity controls things like: note density, chord extension depth (triads vs 7ths vs 9ths), rhythmic variation (straight vs syncopated deltas), velocity humanization range.
+**`GeneratorConfig`** is the single configuration struct passed from the CLI.
+
+**Timing model**: two independent tick counters per generator function:
+- `absoluteTick` — advances by exactly `stepTicks` each step, always a clean
+  multiple. This is what Note On events are anchored to.
+- `lastEventTick` — tracks where the last MIDI event actually landed in the
+  stream. Note On delta = `absoluteTick - lastEventTick`.
+
+This separation ensures Note Ons are always grid-locked regardless of how long
+the previous note rang. Note Offs fire at `noteDuration` ticks after their
+Note On and may land between grid lines.
+
+**Dynamic note lengths**: three layers applied in order:
+1. **Phrase pattern** — a repeating slice of base durations generated once per
+   track. Length is always `phraseLengthBars * stepsPerBar(quantize)` to
+   guarantee bar alignment.
+2. **Velocity correlation** — louder notes ring longer. Velocity range maps to
+   a duration multiplier of `[0.75, 1.10]`.
+3. **Per-note jitter** — a small `±durationJitterFraction` random offset breaks
+   mechanical regularity.
+
+**Chord styles** (chords and progression modes only):
+
+| Style | Duration range | Use case |
+|-------|---------------|----------|
+| `long` | 85–95% of stepTicks | Pads, sustained chords, no overlap |
+| `bouncy` | 25–45% of stepTicks | Rhythm guitar, funk, staccato |
+| `overlap` | unclamped (phrase-driven) | Lush blurred textures, opt-in only |
+
+Overlap is intentionally opt-in. `long` is the default because unclamped
+durations caused unintended chord bleed in early testing.
+
+**Modes**:
+- `melody` — single-note line from scale note pool
+- `chords` — repeated chords of one randomly chosen quality
+- `progression` — diatonic harmony: chords built on each scale degree, with a
+  weighted tonic pull (I chord gets ~2x probability of other degrees)
+
+**Complexity levels**:
+
+| Setting | Note length range | Phrase bars | Rest prob | Chord pool |
+|---------|-------------------|-------------|-----------|------------|
+| simple | 0.8–2.0x step | 1 bar | 5% | triads only |
+| medium | 0.5–2.0x step | 2 bars | 10% | triads + 7ths |
+| complex | 0.3–3.0x step | 2 bars | 20% | all 22 types |
 
 ---
 
-## Phase 3 — CLI Interface
+## Phase 3 — CLI Interface ✅
 
-Use only `flag` from stdlib. Keep it simple:
+All flags with defaults:
 
 ```
-midi-gen \
-  -mode melody \
-  -scale minor \
-  -root C4 \
-  -length 16 \
-  -bpm 120 \
-  -complexity medium \
-  -quantize eighth \
-  -out output.mid
+-mode       melody | chords | progression        (default: melody)
+-scale      major | minor | pentatonic | ...      (default: major)
+-root       note string e.g. C4 F#3 Bb2          (default: C4)
+-octaves    int, note pool range                  (default: 2)
+-length     int, steps to generate               (default: 16)
+-bpm        int, 1–300                            (default: 120)
+-complexity simple | medium | complex             (default: medium)
+-quantize   quarter | eighth | sixteenth          (default: eighth)
+-minvel     int, 0–127                            (default: 60)
+-maxvel     int, 0–127                            (default: 100)
+-ticks      int, ticks per quarter note           (default: 480)
+-chordstyle long | bouncy | overlap               (default: long)
+-out        file path                             (default: output.mid)
+-seed       int64, 0=random                       (default: 0)
+-play       bool [Phase 4]                        (default: false)
 ```
 
-`main.go` parses flags → builds `GeneratorConfig` → calls generator → calls `midi.WriteFile`. Add a `-seed` flag for reproducible outputs.
+Output is always MIDI Format 0 (single track) for maximum DAW compatibility.
 
 ---
 
-## Phase 4 — Sine Synth Playback (MVP+)
+## Phase 4 — Sine Synth Playback (in progress)
 
-**The one external dependency**: [`oto`](https://github.com/ebitengine/oto) by the Ebitengine team. It's the thinnest possible cross-platform audio output layer — gives you a `Write([]byte)` interface for raw PCM samples. No higher-level abstractions.
+**One external dependency**: `github.com/ebitengine/oto/v3`
+
+oto provides a minimal cross-platform PCM audio output interface. On macOS it
+uses CoreAudio. The rest of the synth is pure Go.
+
+### Synth Pipeline
 
 ```
-go get github.com/ebitengine/oto/v3
+midi.Track
+    ↓
+synth.Scheduler.Render()   MIDI events → []float32 PCM
+    ↓
+synth.Reverb.Process()     Schroeder reverb applied to PCM buffer
+    ↓
+synth.Play()               PCM fed to oto, blocks until playback complete
 ```
 
-**`synth/sine.go`** — oscillator:
-```go
-const SampleRate = 44100
+`-play` writes the `.mid` file and plays back simultaneously.
 
-func MIDINoteToFreq(note int) float64 {
-    return 440.0 * math.Pow(2, float64(note-69)/12.0)
-}
+### `synth/sine.go` ✅
 
-// Generates N samples of a sine wave at given freq + amplitude
-func GenerateSine(freq, amplitude float64, numSamples int) []float32 { ... }
+**`Voice`** — one sounding note. Fields:
+- `Phase float64` — sine phase in radians `[0, 2π)`, advances by
+  `2π * freq / SampleRate` per sample. Wrapped each sample to prevent
+  float64 precision loss on long notes.
+- `Velocity float64` — normalised from MIDI 0–127 to `0.0–1.0`.
+- `EnvPhase envPhase` — current ADSR stage (attack/decay/sustain/release/done).
+- `Releasing bool` — set by `Release()` when Note Off is received. The envelope
+  transitions to release on the next `envelope()` call regardless of current stage.
+
+**ADSR envelope**:
+```
+Attack:  linear ramp 0.0 → 1.0 over AttackMs
+Decay:   linear fall 1.0 → SustainLevel over DecayMs
+Sustain: constant at SustainLevel until Release() called
+Release: linear fall SustainLevel → 0.0 over ReleaseMs
 ```
 
-**`synth/scheduler.go`** — the bridge between MIDI events and audio:
+Per-complexity defaults:
 
-This is the interesting part. Walk through your `[]Event` list, convert delta ticks to real time using BPM + TicksPerQN, maintain a list of "active notes", and fill PCM buffers tick by tick. For each moment in time, sum all active oscillators. Apply a simple ADSR envelope (at minimum: a short linear fade-in/out to avoid clicks).
+| Complexity | Attack | Decay | Sustain | Release |
+|-----------|--------|-------|---------|---------|
+| simple | 5ms | 20ms | 0.8 | 30ms |
+| medium | 3ms | 15ms | 0.7 | 50ms |
+| complex | 2ms | 10ms | 0.6 | 80ms |
 
-```go
-type ActiveNote struct {
-    Freq      float64
-    Phase     float64  // current sine phase, advances each sample
-    Remaining int      // samples left to play
-}
+**`RenderSamples`** mixes into the buffer (`+=` not `=`) so multiple voices
+can be summed by calling it on each active voice with the same buffer.
+`masterGain` (typically 0.3) prevents clipping when voices are summed.
+
+### `synth/reverb.go` (next)
+
+Schroeder reverb model: 4 parallel comb filters feeding 2 series allpass filters.
+
+```
+Input → [Comb 1] ─┐
+        [Comb 2] ─┤
+        [Comb 3] ─┤→ sum → [Allpass 1] → [Allpass 2] → wet
+        [Comb 4] ─┘
+
+Output = input*dryMix + wet*wetMix
 ```
 
-**`synth/output.go`** — wire it to oto:
-```go
-func Play(ctx *oto.Context, events []midi.Event, bpm int, tpqn int) {
-    player := ctx.NewPlayer(...)
-    // feed PCM buffers from scheduler
-}
-```
+### `synth/scheduler.go` (next)
 
-Add a `-play` flag to `main.go` that skips file output and pipes directly to the synth instead (or does both).
+Converts `[]midi.Event` into a flat `[]float32` PCM buffer by walking the event
+list, maintaining a pool of active `Voice` objects, and calling
+`RenderSamples` on each active voice per audio buffer chunk.
 
----
+### `synth/output.go` (next)
 
-## Build Order
-
-| Step | What you're building | Testable when done? |
-|------|---------------------|---------------------|
-| 1 | `midi/types.go` + `writer.go` | Yes — open output in GarageBand/MIDI viewer |
-| 2 | `theory/scales.go` + `chords.go` | Yes — unit test note numbers |
-| 3 | `theory/generator.go` | Yes — full CLI works, output .mid files |
-| 4 | `synth/sine.go` | Yes — generate a test tone to file |
-| 5 | `synth/scheduler.go` | Yes — play a hardcoded C major scale |
-| 6 | Wire `-play` flag end-to-end | Yes — full tool complete |
-
----
-
-## Key Gotchas to Watch For
-
-- **Variable-length encoding** is where most people get stuck. Write unit tests for it immediately with values: 0, 127, 128, 255, 16383, 16384.
-- **Track length field** must be computed *after* all events are serialized, then backfilled into bytes 4–7 of the track header.
-- **End of Track** meta-event (`FF 2F 00`) is mandatory or DAWs will reject the file.
-- **Note Off timing**: you must emit a Note Off event for every Note On. Store scheduled-off events in a priority queue or sort events by absolute tick before serializing.
-- **Sine clicks**: without at minimum a 5–10ms fade at note boundaries, every note transition will click. Even a simple linear ramp is enough for MVP.
-- **oto context**: create it once at startup, not per-note. It's expensive to initialize.
+Initialises one `oto.Context` at startup (expensive, created once). Feeds the
+rendered PCM buffer to an `oto.Player` and blocks until playback is complete.
 
 ---
 
@@ -242,7 +269,26 @@ Add a `-play` flag to `main.go` that skips file output and pipes directly to the
 
 ```
 go mod init midi-gen
-go get github.com/ebitengine/oto/v3   # only added for Phase 4
+go get github.com/ebitengine/oto/v3   # added in Phase 4
 ```
 
-Total external dependencies for the full tool: **1** (oto). MIDI file generation is zero-dependency.
+Total external dependencies: **1** (oto). All MIDI generation is zero-dependency.
+
+---
+
+## Testing Approach
+
+Every package has a `_test.go` file in the same package (white-box testing).
+All tests use only `testing` from stdlib — no test frameworks.
+
+Key invariants verified by tests:
+
+- Variable-length encoding correct at every byte-width boundary
+- All generated Note Ons land on exact multiples of `stepTicks` (grid-lock)
+- Note Offs can land between grid lines (intentional — notes ring naturally)
+- Every Note On has a paired Note Off (no stuck notes in DAW or scheduler)
+- Same seed always produces byte-identical output
+- Chord style duration bounds enforced (`long` ≤ 95% step, `bouncy` ≤ 45% step)
+- ADSR envelope starts at 0.0 (no click), reaches sustain level, falls to 0.0
+  on release including early release during attack stage
+- Sine phase stays within `[0, 2π)` — no float64 precision drift
