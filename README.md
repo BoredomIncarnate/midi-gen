@@ -6,7 +6,7 @@ play back audio directly via a built-in sine wave synth with ADSR envelopes
 and Schroeder reverb.
 
 One external dependency (`oto`) for audio playback. All MIDI generation and
-music theory is zero-dependency.
+music theory has zero-dependencies.
 
 ---
 
@@ -87,8 +87,8 @@ The `-chordstyle` flag controls how long chords sustain relative to the step gri
 ### `progression`
 Generates a diatonic chord progression — chords are built on each degree of
 the chosen scale using only in-key notes. The tonic chord (I) is weighted to
-appear more frequently than other degrees, producing progressions that feel
-harmonically grounded.
+appear more frequently than other degrees, producing progressions that try
+to keep things harmonically grounded.
 
 ```sh
 ./midi-gen -mode progression -scale dorian -root D3 -complexity medium -bpm 85
@@ -212,7 +212,7 @@ suitable for auditioning generated patterns before loading into a DAW.
 midi-gen/
 ├── main.go                  # CLI flag parsing and dispatch
 ├── go.mod                   # Module definition
-├── go.sum                   # Dependency checksums (commit this)
+├── go.sum                   # Dependency checksums
 ├── midi/
 │   ├── types.go             # MIDI event structs and constructors
 │   ├── writer.go            # Binary MIDI serialization
