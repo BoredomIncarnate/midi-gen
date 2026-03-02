@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"midi-gen/midi"
+	"midi-gen/synth"
 	"midi-gen/theory"
 )
 
@@ -122,9 +123,20 @@ func main() {
 	fmt.Printf("wrote %s\n", *out)
 
 	// --- Phase 4: playback ---
-	// synth.Play() will be wired here once synth package is implemented.
+	// Render and play the generated track through the system audio device.
+	// The .mid file has already been written above — play runs independently.
 	if *play {
-		fmt.Fprintln(os.Stderr, "note: -play is not yet implemented (Phase 4)")
+		fmt.Println("playing...")
+		opts := synth.PlayOptions{
+			Complexity:   *complexity,
+			MasterGain:   0.3,
+			ReverbDryMix: 0.7,
+			ReverbWetMix: 0.3,
+		}
+		if err := synth.Play(track, *bpm, *ticksPerQN, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "error: playback failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 

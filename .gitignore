@@ -1,2 +1,93 @@
+# =============================================================================
+# midi-gen .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Go build artifacts
+# -----------------------------------------------------------------------------
+
+# Compiled binary (matches the binary name in go build -o midi-gen)
+midi-gen
+
+# Any other compiled binaries in the project root
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries produced by go test -c
+*.test
+
+# Profiling output from go test -bench / go tool pprof
+*.prof
+*.out
+cpu.prof
+mem.prof
+
+# Cover output from go test -coverprofile
+coverage.out
+coverage.html
+
+# Go build cache (normally in $GOCACHE, but some tools write locally)
+/tmp/
+
+# -----------------------------------------------------------------------------
+# Go module cache artifacts
+# -----------------------------------------------------------------------------
+
+# Vendor directory — if you ever run go mod vendor
+# Remove this line if you intentionally commit a vendor directory
+vendor/
+
+# -----------------------------------------------------------------------------
+# Generated MIDI output files
+# -----------------------------------------------------------------------------
+
+# Don't commit generated .mid files — they are build artifacts, not source
 *.mid
+
+# -----------------------------------------------------------------------------
+# macOS
+# -----------------------------------------------------------------------------
+
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode / macOS quarantine attribute files
+*.orig
+
+# -----------------------------------------------------------------------------
+# Editor and IDE
+# -----------------------------------------------------------------------------
+
+# VS Code
+.vscode/
+
+# JetBrains (GoLand)
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+\#*\#
+.\#*
+
+# -----------------------------------------------------------------------------
+# OS / shell
+# -----------------------------------------------------------------------------
+
+# Environment variable files — never commit secrets or local config
+.env
+.env.local
+*.env
+
+# Logs
+*.log
