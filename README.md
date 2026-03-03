@@ -234,7 +234,6 @@ midi-gen/
 │   ├── reverb_test.go
 │   ├── scheduler_test.go
 │   └── output_test.go
-├── PLAN.md                  # Implementation decisions and architecture
 └── .gitignore
 ```
 

@@ -61,6 +61,20 @@ type GeneratorConfig struct {
 	//   "sixteenth" — note ons on sixteenth note boundaries
 	Quantize string
 
+	// Progression is the parsed output of -prog. When non-nil, the generator
+	// uses these chords instead of random selection. Each mode interprets the
+	// progression differently — see generateMelody, generateChords,
+	// generateProgression for details.
+	// nil = use random behaviour (existing default).
+	Progression []ProgChord
+
+	// ChordRate controls how many steps each chord in the progression occupies
+	// before advancing to the next. Only used when Progression is non-nil.
+	//   "beat" — one beat worth of steps (e.g. 2 steps at eighth quantize)
+	//   "bar"  — one full bar of steps  (e.g. 8 steps at eighth quantize)
+	// Default: "bar"
+	ChordRate string
+
 	// ChordStyle controls how long chords sustain relative to the step grid.
 	// Only applies to "chords" and "progression" modes. Ignored in "melody" mode.
 	//   "long"    — chords sustain for ~95% of stepTicks, no bleed into next step.
@@ -308,17 +322,29 @@ func Generate(cfg GeneratorConfig) (midi.Track, error) {
 	phraseLengthSteps := cs.phraseLengthBars * stepsPerBar(cfg.Quantize)
 	phrase := generatePhraseDurations(cs, stepTicks, phraseLengthSteps, rng)
 
+	// Compute stepsPerChord for progression-aware generation.
+	// When cfg.Progression is nil this value is unused — the random generators
+	// ignore it. When non-nil it controls how many steps each chord occupies
+	// before the generator advances to the next chord in the progression.
+	stepsPerChord := 0
+	if cfg.Progression != nil {
+		stepsPerChord, err = StepsPerChord(cfg.ChordRate, cfg.Quantize)
+		if err != nil {
+			return midi.Track{}, err
+		}
+	}
+
 	track := midi.Track{}
 	track.Events = append(track.Events, midi.Tempo(0, cfg.BPM))
 
 	var events []midi.Event
 	switch cfg.Mode {
 	case "melody":
-		events = generateMelody(cfg, cs, rng, notePool, stepTicks, phrase)
+		events = generateMelody(cfg, cs, rng, notePool, stepTicks, phrase, stepsPerChord)
 	case "chords":
-		events, err = generateChords(cfg, cs, rng, stepTicks, phrase)
+		events, err = generateChords(cfg, cs, rng, stepTicks, phrase, stepsPerChord)
 	case "progression":
-		events, err = generateProgression(cfg, cs, rng, stepTicks, phrase)
+		events, err = generateProgression(cfg, cs, rng, stepTicks, phrase, stepsPerChord)
 	default:
 		return midi.Track{}, fmt.Errorf("Generate: unknown mode %q", cfg.Mode)
 	}
@@ -351,7 +377,16 @@ func Generate(cfg GeneratorConfig) (midi.Track, error) {
 //
 // absoluteTick advances by stepTicks every step, unconditionally.
 // lastEventTick is updated after every event written.
-func generateMelody(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, notePool []int, stepTicks uint32, phrase []uint32) []midi.Event {
+//
+// When cfg.Progression is non-nil, the note pool is narrowed at each step to
+// only the tones of the currently active chord. This makes the melody outline
+// the harmonic changes rather than drawing freely from the full scale.
+// If narrowing produces an empty pool (chord tones outside the octave range),
+// the full notePool is used as a fallback for that step.
+//
+// stepsPerChord controls how many steps each chord occupies. It is only used
+// when cfg.Progression is non-nil — pass 0 for random/unspecified behaviour.
+func generateMelody(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, notePool []int, stepTicks uint32, phrase []uint32, stepsPerChord int) []midi.Event {
 	events := []midi.Event{}
 
 	// absoluteTick: current position on the step grid in ticks.
@@ -370,7 +405,19 @@ func generateMelody(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, 
 			continue
 		}
 
-		note := notePool[rng.Intn(len(notePool))]
+		// Determine the note pool for this step.
+		// When a progression is specified, narrow the pool to chord tones
+		// of the currently active chord so the melody outlines the harmony.
+		activePool := notePool
+		if cfg.Progression != nil && stepsPerChord > 0 {
+			activePool = chordTonePool(notePool, cfg.Progression, i, stepsPerChord)
+			// Fall back to full scale pool if no chord tones are in range
+			if len(activePool) == 0 {
+				activePool = notePool
+			}
+		}
+
+		note := activePool[rng.Intn(len(activePool))]
 
 		velocity := cfg.MinVel + rng.Intn(cs.velocityJitter+1)
 		if velocity > cfg.MaxVel {
@@ -396,6 +443,46 @@ func generateMelody(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, 
 	}
 
 	return events
+}
+
+// chordTonePool filters notePool to only the notes that belong to the chord
+// active at the given step index.
+//
+// The chord tones are determined by building the chord from the active
+// ProgChord's root and quality, then collecting all pitch classes that match
+// any note in notePool. This preserves octave range — only notes already in
+// the configured pool are kept, not arbitrary chord tones outside range.
+//
+// Parameters:
+//
+//	notePool      — the full scale note pool built from cfg.RootNote+Scale+Octaves
+//	prog          — the parsed progression slice
+//	step          — current generator step index
+//	stepsPerChord — steps per chord (from StepsPerChord)
+func chordTonePool(notePool []int, prog []ProgChord, step int, stepsPerChord int) []int {
+	activeChord := ProgChordAt(prog, step, stepsPerChord)
+
+	// Build the chord to get its intervals, then collect pitch classes
+	chordNotes, err := BuildChord(activeChord.Root, activeChord.Quality)
+	if err != nil || len(chordNotes) == 0 {
+		return nil
+	}
+
+	// Build a set of chord tone pitch classes (0–11)
+	chordPitchClasses := make(map[int]bool, len(chordNotes))
+	for _, n := range chordNotes {
+		chordPitchClasses[n%12] = true
+	}
+
+	// Filter notePool to notes whose pitch class is in the chord
+	filtered := make([]int, 0, len(notePool))
+	for _, n := range notePool {
+		if chordPitchClasses[n%12] {
+			filtered = append(filtered, n)
+		}
+	}
+
+	return filtered
 }
 
 // chordNoteDuration computes the final note duration for a chord step,
@@ -464,12 +551,20 @@ func chordNoteDuration(baseDuration uint32, velocity int, stepTicks uint32, cfg 
 // All notes in a chord share the same Note Off tick (simultaneous release):
 //   - First Note Off:  delta = noteDuration (ticks after Note On)
 //   - Subsequent Note Offs: delta = 0
-func generateChords(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, stepTicks uint32, phrase []uint32) ([]midi.Event, error) {
+//
+// When cfg.Progression is non-nil, chords are drawn from the progression
+// in order using ProgChordAt rather than randomly. stepsPerChord controls
+// how many steps each chord occupies before advancing.
+//
+// stepsPerChord is only used when cfg.Progression is non-nil.
+func generateChords(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, stepTicks uint32, phrase []uint32, stepsPerChord int) ([]midi.Event, error) {
 	events := []midi.Event{}
 	absoluteTick := uint32(0)
 	lastEventTick := uint32(0)
 
-	quality := cs.chordQualities[rng.Intn(len(cs.chordQualities))]
+	// When no progression is specified, pick one quality for the whole track.
+	// When a progression is specified, quality comes from the ProgChord at each step.
+	randomQuality := cs.chordQualities[rng.Intn(len(cs.chordQualities))]
 
 	scaleNotes, err := ScaleNotes(cfg.RootNote, cfg.Scale, cfg.Octaves)
 	if err != nil {
@@ -482,7 +577,21 @@ func generateChords(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, 
 			continue
 		}
 
-		root := scaleNotes[rng.Intn(len(scaleNotes))]
+		// Determine root and quality for this step.
+		// Progression mode: use the chord specified at this step index.
+		// Random mode: pick a random root from the scale pool and use the
+		// single quality chosen above for the whole track.
+		var root int
+		var quality string
+		if cfg.Progression != nil && stepsPerChord > 0 {
+			pc := ProgChordAt(cfg.Progression, i, stepsPerChord)
+			root = pc.Root
+			quality = pc.Quality
+		} else {
+			root = scaleNotes[rng.Intn(len(scaleNotes))]
+			quality = randomQuality
+		}
+
 		chordNotes, err := BuildChord(root, quality)
 		if err != nil || len(chordNotes) == 0 {
 			absoluteTick += stepTicks
@@ -539,11 +648,21 @@ func generateChords(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, 
 
 // generateProgression produces a diatonic chord progression snapped to the grid.
 // Uses the same timing model as generateChords.
-func generateProgression(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, stepTicks uint32, phrase []uint32) ([]midi.Event, error) {
+//
+// When cfg.Progression is non-nil, chords come from the user-specified
+// progression via ProgChordAt rather than the random diatonic pool.
+// Inversions and voicing from complexity still apply in both cases.
+//
+// stepsPerChord is only used when cfg.Progression is non-nil.
+func generateProgression(cfg GeneratorConfig, cs complexitySettings, rng *rand.Rand, stepTicks uint32, phrase []uint32, stepsPerChord int) ([]midi.Event, error) {
 	events := []midi.Event{}
 	absoluteTick := uint32(0)
 	lastEventTick := uint32(0)
 
+	// Build the diatonic chord pool for random mode.
+	// When cfg.Progression is non-nil this pool is unused — we build it
+	// anyway to avoid a conditional around the scaleSet which is also
+	// needed for quality inference in the random path.
 	scaleNotes, err := ScaleNotes(cfg.RootNote, cfg.Scale, 1)
 	if err != nil {
 		return nil, err
@@ -575,7 +694,7 @@ func generateProgression(cfg GeneratorConfig, cs complexitySettings, rng *rand.R
 		chordPool = append(chordPool, diatonicChord{root: root, quality: quality})
 	}
 
-	if len(chordPool) == 0 {
+	if len(chordPool) == 0 && cfg.Progression == nil {
 		return nil, fmt.Errorf("generateProgression: empty chord pool")
 	}
 
@@ -585,17 +704,48 @@ func generateProgression(cfg GeneratorConfig, cs complexitySettings, rng *rand.R
 			continue
 		}
 
-		var chord diatonicChord
-		if rng.Float64() < 2.0/float64(len(chordPool)+1) {
-			chord = chordPool[0]
+		// Determine root and quality for this step.
+		// Progression mode: use ProgChordAt to look up the specified chord.
+		// Random mode: weighted random selection from diatonic pool with
+		// tonic pull (I chord gets 2x probability).
+		var root int
+		var quality string
+		if cfg.Progression != nil && stepsPerChord > 0 {
+			pc := ProgChordAt(cfg.Progression, i, stepsPerChord)
+			root = pc.Root
+			quality = pc.Quality
 		} else {
-			chord = chordPool[rng.Intn(len(chordPool))]
+			var chord diatonicChord
+			if rng.Float64() < 2.0/float64(len(chordPool)+1) {
+				chord = chordPool[0]
+			} else {
+				chord = chordPool[rng.Intn(len(chordPool))]
+			}
+			root = chord.root
+			quality = chord.quality
 		}
 
-		chordNotes, err := BuildChord(chord.root, chord.quality)
+		// Build the chord voicing from the resolved root and quality.
+		// This runs in both progression and random modes.
+		chordNotes, err := BuildChord(root, quality)
 		if err != nil || len(chordNotes) == 0 {
 			absoluteTick += stepTicks
 			continue
+		}
+
+		// Apply inversions based on complexity — same logic as generateChords.
+		maxInversion := 0
+		switch cfg.Complexity {
+		case "medium":
+			maxInversion = 1
+		case "complex":
+			maxInversion = len(chordNotes) - 1
+		}
+		if maxInversion > 0 {
+			inv := rng.Intn(maxInversion + 1)
+			if inverted, err := BuildChordInversion(root, quality, inv); err == nil {
+				chordNotes = inverted
+			}
 		}
 
 		velocity := cfg.MinVel + rng.Intn(cs.velocityJitter+1)
@@ -672,6 +822,13 @@ func validateConfig(cfg GeneratorConfig) error {
 	validQuantize := map[string]bool{"quarter": true, "eighth": true, "sixteenth": true}
 	if !validQuantize[cfg.Quantize] {
 		return fmt.Errorf("validateConfig: unknown quantize %q", cfg.Quantize)
+	}
+	// ChordRate is only validated when a Progression is specified.
+	if cfg.Progression != nil {
+		validChordRate := map[string]bool{"beat": true, "bar": true}
+		if !validChordRate[cfg.ChordRate] {
+			return fmt.Errorf("validateConfig: unknown chordrate %q (want beat|bar)", cfg.ChordRate)
+		}
 	}
 	// ChordStyle is only required for chord-based modes.
 	// In melody mode it is ignored, so we only validate when mode is chord-related.

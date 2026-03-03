@@ -1,0 +1,32 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+      
+      - name: Build
+        run: go build -o midi-gen${{ runner.os == 'Windows' && '.exe' || '' }} .
+      
+      - name: Test
+        run: go test ./...
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: midi-gen-${{ runner.os }}
+          path: midi-gen${{ runner.os == 'Windows' && '.exe' || '' }}
+          retention-days: 5

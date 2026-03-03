@@ -9,6 +9,10 @@
 # Compiled binary (matches the binary name in go build -o midi-gen)
 midi-gen
 
+# AI assistant instruction files
+.github/copilot-instructions.md
+GEMINI.md
+
 # Any other compiled binaries in the project root
 *.exe
 *.exe~

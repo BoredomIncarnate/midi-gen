@@ -1,11 +1,21 @@
 # Feature Plan: Custom Progression Specification
 
+## Status
+
+- `theory/progression.go` — complete ✅
+- `theory/progression_test.go` — complete ✅
+- `GeneratorConfig` additions — pending
+- Generator function changes — pending
+- `main.go` wiring — pending
+
+---
+
 ## Overview
 
-Add a `-prog` flag that lets the user specify a chord progression explicitly
-rather than relying on random generation. The progression works across all
-three modes (`melody`, `chords`, `progression`) and controls which chords are
-active at each point in the sequence.
+A `-prog` flag lets the user specify a chord progression explicitly rather than
+relying on random generation. The progression works across all three modes
+(`melody`, `chords`, `progression`) and controls which chords are active at
+each point in the sequence.
 
 A companion `-chordrate` flag controls how many steps each chord occupies
 before moving to the next.
@@ -17,10 +27,10 @@ before moving to the next.
 ```
 -prog       string   Space-separated chord list. Omit for random behaviour (existing default).
                      Examples:
-                       "1 4 5 1"           scale degrees
-                       "C F G C"           note names (octave inferred from -root)
-                       "C:maj7 F:min G:dom7 C"  note names with explicit quality
-                       "1 4:min7 5 1"      scale degrees with explicit quality
+                       "1 4 5 1"                    scale degrees
+                       "C F G C"                    note names (octave inferred from -root)
+                       "C:maj7 F:minor G:dom7 C"    note names with explicit quality
+                       "2:min7 5:dom7 1:maj7"       scale degrees with explicit quality
 
 -chordrate  string   How many steps each chord occupies before advancing.
                      beat  — one beat worth of steps (e.g. 2 steps at eighth quantize)
@@ -32,58 +42,63 @@ before moving to the next.
 
 ## Input Format
 
-Each token in `-prog` is one chord. Tokens are separated by spaces.
+Each token in `-prog` is one chord separated by spaces. All tokens must use
+the same format — mixing scale degrees and note names in one string returns
+an error.
 
 ### Scale degrees (`1`–`7`)
 
-A single integer from 1 to 7 selects the note at that position in the current
-scale (1-indexed). The root note for the chord is `ScaleNotes[degree-1]`.
+A single integer from 1 to 7 selects the note at that position in the scale
+(1-indexed). The root note for the chord is `ScaleNotes[degree-1]`.
 
 ```
-"1 4 5 1"   →  I  IV  V  I  (classic cadence)
-"1 6 4 5"   →  I  vi  IV  V (pop progression)
-"2 5 1"     →  ii  V  I    (jazz cadence)
+"1 4 5 1"   →  I  IV  V  I   (classic cadence)
+"1 6 4 5"   →  I  vi  IV  V  (pop progression)
+"2 5 1"     →  ii  V   I     (jazz cadence)
 ```
 
 Quality is inferred from the scale unless overridden with `:quality`.
 
+Scales with fewer than 7 notes (e.g. pentatonic = 5 notes) only support
+degrees 1 through the scale length.
+
 ### Note names (`C`, `F#`, `Bb`, etc.)
 
-A note name without an octave number. The octave is inferred from the `-root`
-flag — the chord root is placed in the same octave as the root note, or the
-nearest octave above if the named note is below the root pitch class.
+A note name without an octave number. The octave is inferred from `-root`:
+the chord root is placed in the same octave as the root note, or the next
+octave up if the named note's pitch class is below the root's pitch class.
 
 ```
-"C F G C"     →  C  F  G  C  (major scale I IV V I from C)
-"A C E G"     →  A  C  E  G  (ascending by thirds)
+"C F G C"   →  C  F  G  C  (I IV V I from C)
+"A C E G"   →  A  C  E  G  (ascending thirds)
 ```
 
 Quality is inferred from the scale unless overridden with `:quality`.
 
 ### Explicit quality override (`:quality`)
 
-Any token can include a `:quality` suffix to override the inferred chord quality.
-The quality must be a key in `ChordIntervals` (e.g. `major`, `minor`, `maj7`,
-`dom7`, `min7`, `dim`, `aug`, `sus4`, etc.).
+Any token can include a `:quality` suffix to override diatonic inference.
+The quality must be a canonical key in `ChordIntervals`:
+
+```
+major, minor, dim, aug, sus2, sus4
+dom7, maj7, min7, minmaj7, dim7, halfdim7, augmaj7, dom7sus4
+maj9, dom9, min9, dom11, maj13
+add9, minadd9, maj6, min6
+```
 
 ```
 "1 4:maj7 5:dom7 1"
-"C:maj7 F:min G:dom7 C"
-"2:min7 5:dom7 1:maj7"   (ii-V-I in jazz voicing)
+"C:maj7 F:minor G:dom7 C"
+"2:min7 5:dom7 1:maj7"
 ```
-
-If the quality suffix is omitted, quality is inferred diatonically from the
-scale (same logic as the existing `generateProgression` function).
 
 ---
 
 ## Chord Rate
 
-`-chordrate` determines how many steps each chord in the progression occupies
-before advancing to the next chord. After the last chord, the progression
-cycles back to the first.
-
-Step counts per chord by quantize and chordrate:
+`-chordrate` determines how many steps each chord occupies before advancing.
+After the last chord the progression cycles back to the first.
 
 | Quantize | `beat` | `bar` |
 |----------|--------|-------|
@@ -91,15 +106,7 @@ Step counts per chord by quantize and chordrate:
 | `eighth` | 2 steps | 8 steps |
 | `sixteenth` | 4 steps | 16 steps |
 
-Formula:
-```
-stepsPerBeat = 1                          (quarter = 1 beat per step)
-stepsPerBeat = 2                          (eighth  = 2 steps per beat)
-stepsPerBeat = 4                          (sixteenth = 4 steps per beat)
-
-chordrate=beat → stepsPerChord = stepsPerBeat
-chordrate=bar  → stepsPerChord = stepsPerBeat * 4  (4/4 time assumed)
-```
+4/4 time is assumed throughout (4 beats per bar).
 
 ---
 
@@ -107,133 +114,115 @@ chordrate=bar  → stepsPerChord = stepsPerBeat * 4  (4/4 time assumed)
 
 ### `melody` with `-prog`
 
-The progression defines a harmonic map over the sequence. At each step, the
-active chord is determined by which progression slot the step falls in.
+The progression defines a harmonic map over the sequence. At each step the
+note pool is filtered to only the tones of the currently active chord. This
+makes the melody outline the chord changes rather than drawing freely from
+the full scale.
 
-The note pool for that step is filtered to only notes that belong to the
-active chord's tones (root, third, fifth, seventh etc). This makes the melody
-follow the harmonic rhythm of the progression — notes will outline the chord
-changes rather than drawing freely from the full scale.
-
-If a step's filtered note pool is empty (e.g. the chord has no tones in the
-current octave range), it falls back to the full scale pool for that step.
+If the filtered pool is empty for a step (chord tones outside the configured
+octave range), it falls back to the full scale pool for that step.
 
 ```
--prog "1 4 5 1" -chordrate bar -mode melody
-→ bar 1: melody uses notes from chord I
-→ bar 2: melody uses notes from chord IV
-→ bar 3: melody uses notes from chord V
-→ bar 4: melody uses notes from chord I
-→ repeats if -length exceeds 4 bars
+-prog "1 4 5 1" -chordrate bar -mode melody -quantize eighth
+→ steps  0–7:  melody draws from chord I tones
+→ steps  8–15: melody draws from chord IV tones
+→ steps 16–23: melody draws from chord V tones
+→ steps 24–31: melody draws from chord I tones
+→ cycles if -length exceeds 32 steps
 ```
 
 ### `chords` with `-prog`
 
-Each chord slot plays the specified chord for `stepsPerChord` steps, then
+Each chord slot plays the specified chord for `stepsPerChord` steps then
 advances. The `-chordstyle` flag still controls note duration within each step.
 
 ```
--prog "1 4 5 1" -chordrate bar -mode chords
-→ 8 steps of chord I (one bar at eighth quantize)
-→ 8 steps of chord IV
-→ 8 steps of chord V
-→ 8 steps of chord I
-→ repeats
+-prog "1 4 5 1" -chordrate bar -mode chords -quantize eighth
+→ steps  0–7:  chord I
+→ steps  8–15: chord IV
+→ steps 16–23: chord V
+→ steps 24–31: chord I
+→ cycles
 ```
 
 ### `progression` with `-prog`
 
-Same as `chords` but with inversions applied based on complexity and the
-existing diatonic voice-leading logic. The `-prog` flag controls which chords
-appear and in what order; the `progression` mode controls how they are voiced.
+Same as `chords` but with inversions applied based on complexity. The `-prog`
+flag controls which chords appear and in what order; the `progression` mode
+controls how they are voiced.
 
 ---
 
-## Implementation Plan
+## Implementation
 
-### 1. `theory/progression.go` (new file)
+### `theory/progression.go` ✅
 
 **Types:**
 
 ```go
-// ProgChord represents one parsed chord in a user-specified progression.
 type ProgChord struct {
     Root    int     // MIDI note number of the chord root
     Quality string  // chord quality key from ChordIntervals
 }
 ```
 
-**Functions:**
+**Exported functions:**
 
 ```go
-// ParseProgression parses a -prog string into a []ProgChord.
-// rootNote and scaleName are used for degree/name resolution and quality inference.
-// octave is used when resolving bare note names without an octave number.
-func ParseProgression(prog string, rootNote int, scaleName string) ([]ProgChord, error)
+// ParseProgression parses a -prog flag string into []ProgChord.
+// Returns (nil, nil) for empty input — signals random behaviour to generator.
+func ParseProgression(prog string, rootNote int, scaleName string, complexity string) ([]ProgChord, error)
 
-// parseDegree resolves a scale degree token ("1"–"7") to a ProgChord.
-func parseDegree(token string, degree int, scaleNotes []int, scaleSet map[int]bool) (ProgChord, error)
-
-// parseNoteName resolves a note name token ("C", "F#", "Bb") to a ProgChord.
-// Infers octave from rootNote.
-func parseNoteName(token string, rootNote int, scaleSet map[int]bool) (ProgChord, error)
-
-// inferQuality determines major or minor quality from whether the major third
-// above the root exists in the scale. Upgrades to maj7/min7 at medium/complex
-// complexity. Same logic as generateProgression.
-func inferQuality(root int, scaleSet map[int]bool, complexity string) string
-
-// StepsPerChord returns the number of generator steps each chord occupies.
+// StepsPerChord returns steps per chord for a given chordrate and quantize.
 func StepsPerChord(chordRate string, quantize string) (int, error)
+
+// ProgChordAt returns the chord active at a given step, cycling as needed.
+func ProgChordAt(prog []ProgChord, step int, stepsPerChord int) ProgChord
 ```
 
-### 2. `GeneratorConfig` additions (`theory/generator.go`)
+**Internal functions:**
+
+```go
+func splitToken(token string) (base, quality string)
+func parseDegree(degree int, qualityOverride string, scaleNotes []int, scaleSet map[int]bool, complexity string) (ProgChord, error)
+func parseNoteName(noteName string, qualityOverride string, rootNote int, scaleSet map[int]bool, complexity string) (ProgChord, error)
+func inferQuality(root int, scaleSet map[int]bool, complexity string) string
+```
+
+### `GeneratorConfig` additions (pending)
 
 ```go
 Progression []ProgChord  // nil = random (existing behaviour preserved)
 ChordRate   string       // "beat" | "bar" — default "bar"
 ```
 
-### 3. Generator changes (`theory/generator.go`)
+### Generator changes (pending)
 
-- `generateMelody`: when `cfg.Progression != nil`, build a per-step chord
-  index from `StepsPerChord`, filter the note pool to chord tones at each step.
-- `generateChords`: when `cfg.Progression != nil`, cycle through the progression
-  using the chord index instead of random root selection.
-- `generateProgression`: when `cfg.Progression != nil`, use the parsed chords
+- `generateMelody`: when `cfg.Progression != nil`, filter note pool to chord
+  tones at each step using `ProgChordAt`.
+- `generateChords`: when `cfg.Progression != nil`, use `ProgChordAt` instead
+  of random root selection.
+- `generateProgression`: when `cfg.Progression != nil`, use parsed chords
   instead of diatonic random selection, still applying inversions.
-- `validateConfig`: validate `ChordRate` when `Progression` is set.
+- `validateConfig`: validate `ChordRate` is `"beat"` or `"bar"` when
+  `Progression` is non-nil.
 
-### 4. `main.go` additions
+### `main.go` additions (pending)
 
 ```go
-prog      := flag.String("prog", "", "chord progression e.g. \"1 4 5 1\" or \"C F G C\"")
-chordRate := flag.String("chordrate", "bar", "chord duration: beat | bar")
+prog      := flag.String("prog", "", `chord progression e.g. "1 4 5 1" or "C F G C"`)
+chordRate := flag.String("chordrate", "bar", "chord duration per step: beat | bar")
 ```
 
-Parse `-prog` via `theory.ParseProgression` after flag parsing. If the result
-is non-nil, set `cfg.Progression`. Pass `*chordRate` as `cfg.ChordRate`.
-
-### 5. `theory/progression_test.go` (new file)
-
-Key test cases:
-- Degree parsing: `"1 4 5 1"` produces correct roots from C major scale
-- Note name parsing: `"C F G C"` resolves to correct MIDI note numbers
-- Quality override: `"1 4:maj7 5:dom7 1"` preserves explicit qualities
-- Quality inference: degree on a major scale degree gets `major`, minor degree gets `minor`
-- Mixed formats rejected: `"1 F 5"` mixing degrees and notes returns an error
-- Invalid degree: `"8"` or `"0"` returns an error
-- Invalid quality: `"1:superchord"` returns an error
-- `StepsPerChord`: all quantize × chordrate combinations produce correct counts
-- Cycling: progression repeats correctly when length exceeds chord count
-- Empty prog string returns nil, not an error
+Parse `-prog` via `theory.ParseProgression` after flag parsing. Pass the
+result as `cfg.Progression` and `*chordRate` as `cfg.ChordRate`.
 
 ---
 
 ## Examples
 
 ```sh
-# Classic I-IV-V-I, one bar each, chords mode
+# Classic I-IV-V-I, one bar each
 ./midi-gen -mode chords -scale major -root C3 -prog "1 4 5 1" -chordrate bar -chordstyle long
 
 # ii-V-I jazz cadence with explicit 7th chords
@@ -242,14 +231,17 @@ Key test cases:
 # Melody that follows a I-VI-IV-V progression
 ./midi-gen -mode melody -scale major -root C4 -prog "1 6 4 5" -chordrate bar -length 32
 
-# Same progression, one chord per beat instead of per bar
+# One chord per beat for a busier rhythmic feel
 ./midi-gen -mode chords -scale major -root C3 -prog "1 4 5 1" -chordrate beat -chordstyle bouncy
 
 # Note names instead of degrees
 ./midi-gen -mode progression -scale major -root C3 -prog "C F G C" -chordrate bar
 
-# Mixed with explicit quality on the V chord
+# Explicit quality on the V chord
 ./midi-gen -mode chords -scale major -root C3 -prog "C F G:dom7 C" -chordrate bar
+
+# Play back immediately
+./midi-gen -mode chords -scale major -root C3 -prog "1 4 5 1" -chordrate bar -play -out prog.mid
 ```
 
 ---
@@ -258,7 +250,6 @@ Key test cases:
 
 - Omitting `-prog` preserves all existing random behaviour exactly.
 - `-chordrate` is ignored when `-prog` is not specified.
-- All existing flags, modes, complexity levels, and chord styles continue to
-  work as before.
-- The `-seed` flag still produces deterministic output when `-prog` is set
-  (the RNG is still used for velocity, jitter, and rests).
+- All existing flags, modes, complexity levels, and chord styles work as before.
+- The `-seed` flag still produces deterministic output when `-prog` is set —
+  the RNG is still used for velocity, jitter, and rests.
